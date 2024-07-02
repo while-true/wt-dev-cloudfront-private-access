@@ -1,0 +1,523 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Cloudfront Private Access SAM app.
+Parameters:
+  EnvironmentName:
+    Description: Environment type - master, sandbox, or production
+    Type: String
+    AllowedValues:
+      - dev
+      - test
+      - sand
+      - prod
+  AllowedIps:
+    Description: Comma-separated list of allowed IP addresses.
+    Type: String
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub cpa-${EnvironmentName}-bucket
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "cloudfront.amazonaws.com"
+            Action: "s3:GetObject"
+            Resource: !Sub "${S3Bucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: "Origin access control(OAC) for allowing cloudfront to access S3 bucket"
+        Name: !Sub cpa-origin-access-control-${EnvironmentName}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - S3Bucket
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt S3Bucket.RegionalDomainName
+            Id: !Sub "cpa-${EnvironmentName}-s3-origin"
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+        Enabled: true
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        HttpVersion: http2
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          TargetOriginId: !Sub "cpa-${EnvironmentName}-s3-origin"
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: all
+          ViewerProtocolPolicy: redirect-to-https
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !Ref ExtractAccessCookieCloudfrontFunction
+
+  KeyValueStore:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Comment: Key value store for storing JWT secret key.
+      Name: !Sub "cpa-kvs-${EnvironmentName}"
+
+  ExtractAccessCookieCloudfrontFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "cpa-extract-access-cookie-${EnvironmentName}"
+      FunctionConfig:
+        Comment: "Extract access cookie from request headers"
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt KeyValueStore.Arn
+      AutoPublish: true
+      FunctionCode: !Sub |
+        const crypto = require('crypto');
+        import cf from 'cloudfront';
+
+        const kvsId = "${KeyValueStore.Id}";
+        const kvsHandle = cf.kvs(kvsId);
+
+        function validateJWTToken(token, key) {
+            if (!token) {
+                throw new Error('No token supplied');
+            }
+
+            const segments = token.split('.');
+            if (segments.length !== 3) {
+                throw new Error('Not enough or too many segments');
+            }
+
+            const headerSeg = segments[0];
+            const payloadSeg = segments[1];
+            const signatureSeg = segments[2];
+
+            // base64 decode and parse JSON
+            const header = JSON.parse(_base64urlDecode(headerSeg));
+            const payload = JSON.parse(_base64urlDecode(payloadSeg));
+
+            const signingMethod = 'sha256';
+            const signingType = 'hmac';
+
+            const signingInput = [headerSeg, payloadSeg].join('.');
+
+            if (!_verify(signingInput, key, signingMethod, signingType, signatureSeg)) {
+                throw new Error('Signature verification failed');
+            }
+
+            // Support for nbf and exp claims
+            if (payload.nbf && Date.now() < payload.nbf * 1000) {
+                throw new Error('Token not yet active');
+            }
+
+            if (payload.exp && Date.now() > payload.exp * 1000) {
+                throw new Error('Token expired');
+            }
+
+            return payload;
+        }
+
+        function _compare(a, b) {
+            if (a.length != b.length) {
+                return false;
+            }
+
+            let xor = 0;
+            for (let i = 0; i < a.length; i++) {
+                xor |= (a.charCodeAt(i) ^ b.charCodeAt(i));
+            }
+
+            return 0 === xor;
+        }
+
+        function _verify(input, key, method, type, signature) {
+            if (type === "hmac") {
+                return _compare(signature, _sign(input, key, method));
+            } else {
+                throw new Error('Algorithm type not recognized');
+            }
+        }
+
+        function _sign(input, key, method) {
+            return crypto.createHmac(method, key).update(input).digest('base64url');
+        }
+
+        function _base64urlDecode(str) {
+            return Buffer.from(str, 'base64').toString('utf8');
+        }
+
+        async function handler(event) {
+            const request = event.request;
+            const uri = request.uri;
+            
+            if (request.cookies["cf-jwt-cookie"]) {
+                const token = request.cookies["cf-jwt-cookie"].value;
+
+                try {
+                    const secretKey = await kvsHandle.get("JWT_SECRET_KEY");
+                    validateJWTToken(token, secretKey);
+                    return request;
+                } catch (e) {
+                    console.log(e);
+                }
+            }
+
+            if (uri.startsWith('/private-access-login')) {
+                if (!uri.includes('.')) {
+                  request.uri = '/private-access-login/index.html';
+                }
+                else if (uri === '/private-access-login' || uri === '/private-access-login/') {
+                    request.uri = '/private-access-login/index.html';
+                }
+
+                return request;
+            }
+
+            return {
+              statusCode: 302,
+              statusDescription: 'Found',
+              headers:
+                  { "location": { "value": "/private-access-login" } }
+            };
+        }
+
+  PublicApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref EnvironmentName
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'*'"
+        AllowMethods: "'GET,PUT,POST,DELETE,OPTIONS'"
+
+  AwsCrtNodejsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: aws-crt-nodejs
+      Description: AWS CRT Nodejs layer
+      ContentUri: ./layers/aws-crt-nodejs/
+      CompatibleRuntimes:
+        - nodejs20.x
+
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: auth.authHandler
+      CodeUri: ./src/handlers/
+      Runtime: nodejs20.x
+      Timeout: 30
+      Environment:
+        Variables:
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          KVS_ARN: !GetAtt KeyValueStore.Arn
+          AWS_CRT_NODEJS_BINARY_ABSOLUTE_PATH: /opt/aws-crt-nodejs.node
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AllowCloudFrontKVStoreAccess
+              Action:
+                - "cloudfront-keyvaluestore:DescribeKeyValueStore"
+                - "cloudfront-keyvaluestore:GetKey"
+                - "cloudfront-keyvaluestore:PutKey"
+              Effect: Allow
+              Resource:
+                - !GetAtt KeyValueStore.Arn
+      Layers:
+        - !Ref AwsCrtNodejsLayer
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: PublicApiGateway
+            Path: /login
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints:
+          - auth.ts
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: 10.0.0.0/16
+
+  VPCSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Limits security group traffic
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - FromPort: 443
+          ToPort: 443
+          IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+
+  VPCPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  VPCSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref VPCPublicSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-route-table
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref VPCPublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-route-table
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref VPCSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.execute-api
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref VPCSubnet
+      SecurityGroupIds:
+        - !Ref VPCSecurityGroup
+      VpcEndpointType: Interface
+      VpcId: !Ref VPC
+
+  PrivateApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref EnvironmentName
+      EndpointConfiguration:
+        Type: PRIVATE
+        VpcEndpointIds:
+          - !Ref VpcEndpoint
+      Auth:
+        ResourcePolicy:
+          CustomStatements:
+            - Effect: Allow
+              Principal: "*"
+              Action: execute-api:Invoke
+              Resource: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*/*/*
+            - Effect: Deny
+              Principal: "*"
+              Action: execute-api:Invoke
+              Resource: "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*/*/*"
+              Condition:
+                StringNotEquals:
+                  aws:SourceVpce: !Ref VpcEndpoint
+
+  InternalNetworkAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: internalNetworkAuth.internalNetworkAuthHandler
+      CodeUri: ./src/handlers/
+      Runtime: nodejs20.x
+      Timeout: 30
+      Environment:
+        Variables:
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          KVS_ARN: !GetAtt KeyValueStore.Arn
+          AWS_CRT_NODEJS_BINARY_ABSOLUTE_PATH: /opt/aws-crt-nodejs.node
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AllowCloudFrontKVStoreAccess
+              Action:
+                - "cloudfront-keyvaluestore:DescribeKeyValueStore"
+                - "cloudfront-keyvaluestore:GetKey"
+                - "cloudfront-keyvaluestore:PutKey"
+              Effect: Allow
+              Resource:
+                - !GetAtt KeyValueStore.Arn
+      Layers:
+        - !Ref AwsCrtNodejsLayer
+      VpcConfig:
+        SubnetIds:
+          - !Ref VPCSubnet
+        SecurityGroupIds:
+          - !Ref VPCSecurityGroup
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: PrivateApiGateway
+            Path: /login
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints:
+          - internalNetworkAuth.ts
+
+  ProxyAPIGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-external-api
+      StageName: !Ref EnvironmentName
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'*'"
+        AllowMethods: "'GET,PUT,POST,DELETE,OPTIONS'"
+
+  ProxyLambdaFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Handler: proxyLambda.proxyLambdaHandler
+      CodeUri: ./src/handlers/
+      Runtime: nodejs20.x
+      Timeout: 30
+      Environment:
+        Variables:
+          INTERNAL_API_URL: !Sub "https://${PrivateApiGateway}-${VpcEndpoint}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}"
+          ALLOWED_IPS: !Ref AllowedIps
+      VpcConfig:
+        SubnetIds:
+          - !Ref VPCSubnet
+        SecurityGroupIds:
+          - !Ref VPCSecurityGroup
+      Events:
+        Get:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ProxyAPIGateway
+            Path: /login
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: "es2020"
+        Sourcemap: true
+        EntryPoints:
+          - proxyLambda.ts
+
+Outputs:
+  CloudFrontDomainName:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Description: "CloudFront Domain Name"
+
+  CloudFrontDistributionId:
+    Value: !GetAtt CloudFrontDistribution.Id
+    Description: "CloudFront Distribution Id"
+
+  S3BucketName:
+    Value: !Ref S3Bucket
+    Description: "S3 Bucket Name"
+
+  PublicApiGateway:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${PublicApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/"
+
+  VpcEndpointUrl:
+    Description: "VPC Endpoint URL"
+    Value: !Sub "https://${PrivateApiGateway}-${VpcEndpoint}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/"
+
+  ProxyAPIGateway:
+    Description: "External API Gateway endpoint URL"
+    Value: !Sub "https://${ProxyAPIGateway}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/"

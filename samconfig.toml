@@ -1,0 +1,33 @@
+version = 0.1
+
+[sand]
+[sand.deploy]
+[sand.deploy.parameters]
+stack_name = "cloudfront-private-access-sand"
+resolve_s3 = true
+s3_prefix = "cloudfront-private-access-sand"
+region = "us-east-1"
+confirm_changeset = false
+disable_rollback = true
+capabilities = ["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"]
+image_repositories = []
+parameter_overrides = [
+    "EnvironmentName=\"sand\"",
+    "AllowedIps=\"192.168.0.1\"",
+]
+
+[prod]
+[prod.deploy]
+[prod.deploy.parameters]
+stack_name = "cloudfront-private-access-prod"
+resolve_s3 = true
+s3_prefix = "cloudfront-private-access-prod"
+region = "us-east-1"
+confirm_changeset = false
+disable_rollback = false
+capabilities = ["CAPABILITY_IAM", "CAPABILITY_AUTO_EXPAND"]
+image_repositories = []
+parameter_overrides = [
+    "EnvironmentName=\"prod\"",
+    "AllowedIps=\"192.168.0.1\"",
+]
